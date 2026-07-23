@@ -27,6 +27,17 @@ from vllm.transformers_utils.utils import is_s3
 logger = init_logger(__name__)
 
 
+def _get_global_rank() -> int:
+    """Global rank across TP/PP/DP. Each worker owns a unique shard file."""
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    return get_tensor_model_parallel_rank()
+
+
 class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
@@ -109,14 +120,12 @@ class ShardedStateLoader(BaseModelLoader):
         self._prepare_weights(model_config.model, model_config.revision)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
-        from vllm.distributed import get_tensor_model_parallel_rank
-
         model_weights = model_config.model
         if model_weights_override := model_config.model_weights:
             model_weights = model_weights_override
         local_model_path = model_weights
 
-        rank = get_tensor_model_parallel_rank()
+        rank = _get_global_rank()
         pattern = os.path.join(
             local_model_path,
             self.pattern.format(rank=rank, part="*"),
@@ -134,6 +143,8 @@ class ShardedStateLoader(BaseModelLoader):
                 f"Could not find checkpoint files '{pattern}', only "
                 f"pre-sharded checkpoints are currently supported!"
             )
+        else:
+            logger.info("Loading weights from %s", filepaths)
         state_dict = self._filter_subtensors(model.state_dict())
         counter_before_loading_weights = time.perf_counter()
         for key, tensor in self.iterate_over_files(filepaths):
@@ -160,7 +171,17 @@ class ShardedStateLoader(BaseModelLoader):
             counter_after_loading_weights - counter_before_loading_weights,
         )
         if state_dict:
-            raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
+            skip_suffixes = ("._q_scale", "._k_scale", "._v_scale", "._prob_scale")
+            missing_params = {
+                k
+                for k in state_dict
+                if any(k.endswith(suffix) for suffix in skip_suffixes)
+            }
+            other_missing = set(state_dict.keys()) - missing_params
+            if other_missing:
+                raise ValueError(
+                    f"Missing keys {tuple(other_missing)} in loaded state!"
+                )
 
     def iterate_over_files(
         self, paths
