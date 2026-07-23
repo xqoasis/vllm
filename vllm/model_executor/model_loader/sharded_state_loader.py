@@ -10,6 +10,7 @@ from copy import copy
 from typing import Any
 
 import torch
+import veturboio
 from torch import nn
 
 from vllm.config import ModelConfig
@@ -167,13 +168,12 @@ class ShardedStateLoader(BaseModelLoader):
         if self.load_config.load_format == "runai_streamer_sharded":
             yield from runai_safetensors_weights_iterator(paths, True)
         else:
-            from safetensors.torch import safe_open
-
             for path in paths:
-                with safe_open(path, framework="pt") as f:
-                    for key in f.keys():  # noqa: SIM118
-                        tensor = f.get_tensor(key)
-                        yield key, tensor
+                state = veturboio.load(
+                    path,
+                    enable_fast_mode=True,
+                )
+                yield from state.items()
 
     @staticmethod
     def save_model(

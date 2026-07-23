@@ -23,7 +23,8 @@ import huggingface_hub.constants
 import numpy as np
 import regex as re
 import torch
-from safetensors.torch import load, load_file, safe_open, save_file
+import veturboio
+from safetensors.torch import load_file, safe_open, save_file
 from tqdm.auto import tqdm
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
@@ -863,6 +864,23 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _sorted_state_items(
+    state_dict: dict[str, torch.Tensor],
+) -> list[tuple[str, torch.Tensor]]:
+    """Yield ``state_dict`` items in lexicographically sorted key order.
+
+    ``AutoWeightsLoader._groupby_prefix`` uses ``itertools.groupby`` over the
+    top-level name component, which only groups *consecutive* entries. Loaders
+    that buffer related tensors across a single ``load_weights`` pass (e.g. the
+    fused FP8 indexer ``wk`` weight + its ``weight_scale_inv``) therefore rely on
+    all weights sharing a top-level prefix arriving contiguously. ``safetensors``
+    checkpoints store keys sorted (``save_file`` sorts them), so the upstream
+    ``safe_open(...).keys()`` path preserved that invariant. ``veturboio.load``
+    does not guarantee the stored key order, so we re-sort here to restore it.
+    """
+    return sorted(state_dict.items(), key=lambda kv: kv[0])
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -875,8 +893,9 @@ def safetensors_weights_iterator(
     """Iterate over the weights in the model safetensor files.
 
     When *local_expert_ids* is provided, expert weights not belonging to
-    this rank are skipped **before** reading from disk, which drastically
-    reduces storage I/O for MoE models under EP.
+    this rank are omitted. The ``safe_open`` torchao path skips them before
+    reading tensor data; the file-level ``veturboio.load`` paths filter the
+    returned state dict after loading each shard.
     """
     loading_desc = "Loading safetensors checkpoint shards"
     if safetensors_load_strategy == "eager":
@@ -956,9 +975,11 @@ def safetensors_weights_iterator(
         bar_format=_BAR_FORMAT,
     ):
         if safetensors_load_strategy == "eager":
-            with open(st_file, "rb") as f:
-                state_dict = load(f.read())
-            for name, param in state_dict.items():
+            state_dict = veturboio.load(
+                st_file,
+                enable_fast_mode=True,
+            )
+            for name, param in _sorted_state_items(state_dict):
                 if not should_skip_weight(name, local_expert_ids):
                     yield name, param
         elif safetensors_load_strategy == "torchao":
@@ -992,11 +1013,12 @@ def safetensors_weights_iterator(
                 )
             yield from unflattened_state_dict.items()
         else:
-            with safe_open(st_file, framework="pt") as f:
-                for name in f.keys():  # noqa: SIM118
-                    if should_skip_weight(name, local_expert_ids):
-                        continue
-                    param = f.get_tensor(name)
+            state_dict = veturboio.load(
+                st_file,
+                enable_fast_mode=True,
+            )
+            for name, param in _sorted_state_items(state_dict):
+                if not should_skip_weight(name, local_expert_ids):
                     yield name, param
 
 
@@ -1007,27 +1029,17 @@ def multi_thread_safetensors_weights_iterator(
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
 
-    def _load_file(st_file: str):
-        result = load_file(st_file, device="cpu")
-        return result
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Note to use generator here so we do not store all the loaded files in memory
-        # at the same time, which can cause OOM for large models.
-        futures = (executor.submit(_load_file, st_file) for st_file in hf_weights_files)
-        futures_iter = tqdm(
-            concurrent.futures.as_completed(futures),
-            total=len(hf_weights_files),
-            desc="Multi-thread loading shards",
-            disable=not enable_tqdm(use_tqdm_on_load),
-            bar_format=_BAR_FORMAT,
+    for st_file in tqdm(
+        sorted(hf_weights_files, key=_natural_sort_key),
+        desc="Loading safetensors checkpoint use veturboio",
+        disable=not enable_tqdm(use_tqdm_on_load),
+        bar_format=_BAR_FORMAT,
+    ):
+        state_dict = veturboio.load(
+            st_file,
+            enable_fast_mode=True,
         )
-
-        for future in futures_iter:
-            state_dict = future.result()
-            del future
-            for key in list(state_dict):
-                yield key, state_dict.pop(key)
+        yield from _sorted_state_items(state_dict)
 
 
 def runai_safetensors_weights_iterator(
