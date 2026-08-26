@@ -29,17 +29,20 @@ ls -l
 # custom env and defaults
 # =====================
 : "${CUSTOM_TARGET_ARCH:=${ARCH:-$(uname -m)}}"
-: "${CUSTOM_CUDA_TAG:=cu129}"
+# vLLM v0.28's supported CUDA release matrix is Torch 2.13 + CUDA 13.0.
+# The cu129 branch below remains available only for callers that also override
+# the Torch suite to a version published on the cu129 index.
+: "${CUSTOM_CUDA_TAG:=cu130}"
 
-: "${CUSTOM_TORCH_VERSION:=2.10.0}"
-: "${CUSTOM_TORCHAUDIO_VERSION:=2.10.0}"
-: "${CUSTOM_TORCHVISION_VERSION:=0.25.0}"
-: "${CUSTOM_TORCH_ABI_TAG:=th210}"
+: "${CUSTOM_TORCH_VERSION:=2.13.0}"
+: "${CUSTOM_TORCHAUDIO_VERSION:=2.11.0}"
+: "${CUSTOM_TORCHVISION_VERSION:=0.28.0}"
+: "${CUSTOM_TORCH_ABI_TAG:=th213}"
 
 : "${CUSTOM_PYPI_INDEX_URL:=https://bytedpypi.byted.org/simple}"
 : "${CUSTOM_PYPI_EXTRA_INDEX_URL:=https://bytedpypi.byted.org/simple}"
 
-: "${CUSTOM_TRITON_VERSION:=v3.5.0}"
+: "${CUSTOM_TRITON_VERSION:=v3.7.1}"
 
 # 默认别开太多 arch，避免 nvcc OOM。
 # 如需 sm_120，可以外部覆盖：
