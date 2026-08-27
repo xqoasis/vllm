@@ -42,7 +42,7 @@ ls -l
 : "${CUSTOM_PYPI_INDEX_URL:=https://bytedpypi.byted.org/simple}"
 : "${CUSTOM_PYPI_EXTRA_INDEX_URL:=https://bytedpypi.byted.org/simple}"
 
-: "${CUSTOM_TRITON_VERSION:=v3.7.1}"
+: "${CUSTOM_TRITON_KERNELS_VERSION:=v3.5.1}"
 
 # 默认别开太多 arch，避免 nvcc OOM。
 # 如需 sm_120，可以外部覆盖：
@@ -313,14 +313,16 @@ retry pip install \
 mkdir -p .deps
 rm -rf .deps/triton-src
 
-retry git clone --depth 1 --branch "${CUSTOM_TRITON_VERSION}" \
+retry git clone --depth 1 --branch "${CUSTOM_TRITON_KERNELS_VERSION}" \
   "https://github.com/triton-lang/triton.git" \
   .deps/triton-src
 
 export TRITON_KERNELS_SRC_DIR="$PWD/.deps/triton-src/python/triton_kernels/triton_kernels"
 test -f "${TRITON_KERNELS_SRC_DIR}/__init__.py"
+test -f "${TRITON_KERNELS_SRC_DIR}/matmul_ogs.py"
 
 echo "TRITON_KERNELS_SRC_DIR=${TRITON_KERNELS_SRC_DIR}"
+echo "CUSTOM_TRITON_KERNELS_VERSION=${CUSTOM_TRITON_KERNELS_VERSION}"
 echo "VLLM_VERSION_OVERRIDE=${VLLM_VERSION_OVERRIDE}"
 
 # =====================
