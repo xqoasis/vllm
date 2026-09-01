@@ -265,15 +265,19 @@ retry pip install \
 
 # Do not use --no-cache-dir here.
 # Torch wheels are large; keeping pip cache helps retries and unstable networks.
-retry pip install \
-  --retries "${CUSTOM_PIP_RETRIES}" \
-  --timeout "${CUSTOM_PIP_TIMEOUT}" \
-  --progress-bar off \
-  torch=="${CUSTOM_TORCH_VERSION}" \
-  torchaudio=="${CUSTOM_TORCHAUDIO_VERSION}" \
-  torchvision=="${CUSTOM_TORCHVISION_VERSION}" \
-  --index-url "${TORCH_INDEX_URL}" \
-  --extra-index-url "${CUSTOM_PYPI_EXTRA_INDEX_URL}"
+if [ "${CUSTOM_SKIP_TORCH_INSTALL:-0}" = "1" ]; then
+  echo "CUSTOM_SKIP_TORCH_INSTALL=1, skipping torch/torchaudio/torchvision install"
+else
+  retry pip install \
+    --retries "${CUSTOM_PIP_RETRIES}" \
+    --timeout "${CUSTOM_PIP_TIMEOUT}" \
+    --progress-bar off \
+    torch=="${CUSTOM_TORCH_VERSION}" \
+    torchaudio=="${CUSTOM_TORCHAUDIO_VERSION}" \
+    torchvision=="${CUSTOM_TORCHVISION_VERSION}" \
+    --index-url "${TORCH_INDEX_URL}" \
+    --extra-index-url "${CUSTOM_PYPI_EXTRA_INDEX_URL}"
+fi
 
 python3 - <<PY
 import torch
