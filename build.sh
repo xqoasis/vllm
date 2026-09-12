@@ -32,7 +32,15 @@ ls -l
 # vLLM v0.28's supported CUDA release matrix is Torch 2.13 + CUDA 13.0.
 # The cu129 branch below remains available only for callers that also override
 # the Torch suite to a version published on the cu129 index.
+# cu133 assumes an NVIDIA NGC base image that already ships PyTorch and the
+# CUDA toolkit, so neither is installed by default.
 : "${CUSTOM_CUDA_TAG:=cu130}"
+
+if [ "${CUSTOM_CUDA_TAG}" = "cu133" ]; then
+  : "${CUSTOM_SKIP_TORCH_INSTALL:=1}"
+else
+  : "${CUSTOM_SKIP_TORCH_INSTALL:=0}"
+fi
 
 : "${CUSTOM_TORCH_VERSION:=2.13.0}"
 : "${CUSTOM_TORCHAUDIO_VERSION:=2.11.0}"
@@ -103,6 +111,7 @@ esac
 # resolve cuda
 # =====================
 CUDA_INSTALL_METHOD="runfile"
+CUDA_RUNFILE_URL=""
 
 case "${CUSTOM_CUDA_TAG}" in
   cu129)
@@ -145,9 +154,30 @@ case "${CUSTOM_CUDA_TAG}" in
     esac
     ;;
 
+  cu133)
+    # NGC base images ship the CUDA 13.3 toolkit; it is never installed here.
+    CUDA_INSTALL_METHOD="preinstalled"
+    CUDA_VERSION="13.3"
+    CUDA_FULL_VERSION="13.3"
+    # Prefer the versioned prefix; fall back to /usr/local/cuda or the prefix
+    # of the nvcc found on PATH (NGC images may lack a versioned entry point).
+    if [ -z "${CUSTOM_CUDA_HOME:-}" ]; then
+      if [ -x "/usr/local/cuda-${CUDA_VERSION}/bin/nvcc" ]; then
+        CUSTOM_CUDA_HOME="/usr/local/cuda-${CUDA_VERSION}"
+      elif [ -x /usr/local/cuda/bin/nvcc ]; then
+        CUSTOM_CUDA_HOME="/usr/local/cuda"
+      elif command -v nvcc >/dev/null 2>&1; then
+        CUSTOM_CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+      else
+        CUSTOM_CUDA_HOME="/usr/local/cuda-${CUDA_VERSION}"
+      fi
+    fi
+    TORCH_INDEX_URL="https://download.pytorch.org/whl/cu133"
+    ;;
+
   *)
     echo "Unsupported CUSTOM_CUDA_TAG=${CUSTOM_CUDA_TAG}"
-    echo "Supported: cu129, cu130"
+    echo "Supported: cu129, cu130, cu133"
     exit 1
     ;;
 esac
@@ -172,6 +202,11 @@ retry apt-get install -y \
 # install cuda toolkit by runfile if missing
 # =====================
 if [ ! -x "${CUSTOM_CUDA_HOME}/bin/nvcc" ]; then
+  if [ "${CUDA_INSTALL_METHOD}" != "runfile" ]; then
+    echo "Error: CUDA install method '${CUDA_INSTALL_METHOD}' expects a preinstalled CUDA toolkit, but nvcc was not found at ${CUSTOM_CUDA_HOME}/bin/nvcc"
+    echo "Set CUSTOM_CUDA_HOME to the CUDA ${CUDA_VERSION} toolkit prefix (NGC images usually expose it at /usr/local/cuda) or use a matching base image."
+    exit 1
+  fi
   echo "nvcc not found at ${CUSTOM_CUDA_HOME}/bin/nvcc"
   echo "Installing CUDA Toolkit ${CUDA_FULL_VERSION} for ${CUSTOM_TARGET_ARCH}..."
   echo "CUDA install method: ${CUDA_INSTALL_METHOD}"
@@ -227,6 +262,7 @@ echo "CUSTOM_TORCH_VERSION=${CUSTOM_TORCH_VERSION}"
 echo "CUSTOM_TORCHAUDIO_VERSION=${CUSTOM_TORCHAUDIO_VERSION}"
 echo "CUSTOM_TORCHVISION_VERSION=${CUSTOM_TORCHVISION_VERSION}"
 echo "CUSTOM_TORCH_ABI_TAG=${CUSTOM_TORCH_ABI_TAG}"
+echo "CUSTOM_SKIP_TORCH_INSTALL=${CUSTOM_SKIP_TORCH_INSTALL}"
 echo "CUSTOM_MAX_JOBS=${CUSTOM_MAX_JOBS}"
 echo "CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}"
 echo "TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
@@ -251,6 +287,13 @@ if [ ! -f "${CUDA_HOME}/include/cuda_runtime.h" ]; then
 fi
 
 "${CUDA_HOME}/bin/nvcc" --version
+
+nvcc_version="$("${CUDA_HOME}/bin/nvcc" --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')"
+if [ "${nvcc_version}" != "${CUDA_VERSION}" ]; then
+  echo "Error: nvcc at ${CUDA_HOME}/bin/nvcc reports CUDA ${nvcc_version:-unknown}, expected ${CUDA_VERSION}"
+  echo "Set CUSTOM_CUDA_HOME to the CUDA ${CUDA_VERSION} toolkit prefix."
+  exit 1
+fi
 
 # =====================
 # python deps
