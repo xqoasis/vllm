@@ -382,7 +382,8 @@ python3 -m build --wheel --no-isolation
 
 cp dist/*.whl output/
 
-whl_name="$(basename "$(ls output/*.whl | head -n1)")"
+whl_files=(output/*.whl)
+whl_name="${whl_files[0]##*/}"
 
 echo "Wheel output: output/${whl_name}"
 
