@@ -38,6 +38,12 @@ from vllm.model_executor.models.vision import (
     get_load_balance_assignment,
     is_vit_use_data_parallel,
 )
+from vllm.models.deepseek_v4.common.ops.fused_vision import (
+    vision_rms_norm,
+    vision_rotary,
+)
+from vllm.platforms import current_platform
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 @lru_cache(8)
@@ -53,6 +59,18 @@ def get_vision_cos_sin(
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    if (
+        current_platform.is_cuda()
+        and x.is_cuda
+        and x.ndim == 3
+        and x.stride(-1) == 1
+        and cos.is_contiguous()
+        and sin.is_contiguous()
+        and cos.shape == sin.shape == (x.shape[0], 1, x.shape[-1] // 2)
+        and cos.dtype == sin.dtype == torch.float32
+        and not torch.is_grad_enabled()
+    ):
+        return vision_rotary(x, cos, sin)
     dtype = x.dtype
     x1, x2 = x.float().chunk(2, dim=-1)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
@@ -65,6 +83,16 @@ class DeepseekV4RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            current_platform.is_cuda()
+            and x.is_cuda
+            and x.ndim == 2
+            and x.stride(-1) == 1
+            and self.weight.is_contiguous()
+            and self.weight.dtype != torch.float64
+            and not torch.is_grad_enabled()
+        ):
+            return vision_rms_norm(x, self.weight, self.eps)
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
@@ -123,15 +151,21 @@ class DeepseekV4VisionAttention(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
         n = x.size(0)
         qkv, _ = self.wqkv(x)
         q, k, v = (t.view(n, self.n_heads, self.head_dim) for t in qkv.chunk(3, -1))
         q = apply_rotary(q, cos, sin).unsqueeze(0)  # (b=1, n, h, d)
         k = apply_rotary(k, cos, sin).unsqueeze(0)
-        # One image per call: a dense batch, no varlen packing metadata.
-        o = self.attn(q, k, v.unsqueeze(0))
+        o = self.attn(
+            q, k, v.unsqueeze(0), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+        )
         out, _ = self.wo(o.reshape(n, -1))
         return out
 
@@ -173,9 +207,14 @@ class DeepseekV4VisionBlock(nn.Module):
         self.mlp = DeepseekV4VisionMLP(config, prefix=f"{prefix}.mlp")
 
     def forward(
-        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin)
+        x = x + self.attn(self.norm1(x), cos, sin, cu_seqlens, max_seqlen)
         return x + self.mlp(self.norm2(x))
 
 
@@ -194,6 +233,36 @@ class DeepseekV4ViT(nn.Module):
             ]
         )
         self.norm = DeepseekV4RMSNorm(config.vision_dim)
+
+    @property
+    def supports_packed_attention(self) -> bool:
+        return current_platform.is_cuda() and all(
+            block.attn.attn.attn_backend == AttentionBackendEnum.FLASH_ATTN
+            and not block.attn.attn.fp8_enabled
+            for block in self.blocks
+        )
+
+    def forward_packed(
+        self, patches: torch.Tensor, vit_grid: list[list[int]]
+    ) -> torch.Tensor:
+        """Encode packed image tokens without attention across image boundaries."""
+        sizes = [h * w for h, w in vit_grid]
+        if not sizes or min(sizes) <= 0 or sum(sizes) != patches.shape[0]:
+            raise ValueError("Image grids must partition the supplied patches")
+        x = self.patch_embed(patches)
+        tables = [
+            get_vision_cos_sin(h, w, self.rope_dim, self.rope_theta)
+            for h, w in vit_grid
+        ]
+        cos, sin = (torch.cat(parts).to(x.device) for parts in zip(*tables))
+        cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(sizes)], dtype=torch.int32, device=x.device
+        )
+        # The attention wrapper reads this scalar on the host at every layer.
+        max_seqlen = torch.tensor(max(sizes), dtype=torch.int32, device="cpu")
+        for block in self.blocks:
+            x = block(x, cos, sin, cu_seqlens, max_seqlen)
+        return self.norm(x)
 
     def forward(
         self, patches: torch.Tensor, n_vit_h: int, n_vit_w: int
@@ -231,14 +300,31 @@ class DeepseekV4Aligner(nn.Module):
             disable_tp=use_data_parallel,
         )
 
-    def forward(self, x: torch.Tensor, n_vit_h: int, n_vit_w: int) -> torch.Tensor:
+    def _merge(self, x: torch.Tensor, n_vit_h: int, n_vit_w: int) -> torch.Tensor:
         r = self.downsample_ratio
         x = x.view(n_vit_h, n_vit_w, -1).permute(2, 0, 1)
         x = F.pad(x, (0, -n_vit_w % r, 0, -n_vit_h % r))
-        x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
+        return F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
+
+    def forward(self, x: torch.Tensor, n_vit_h: int, n_vit_w: int) -> torch.Tensor:
+        x = self._merge(x, n_vit_h, n_vit_w)
         hidden, _ = self.w1(x)
         out, _ = self.w2(F.gelu(hidden))
         return out
+
+    def forward_packed(
+        self, x: torch.Tensor, vit_grid: list[list[int]]
+    ) -> tuple[torch.Tensor, ...]:
+        """Preserve each spatial merge and batch the final projection."""
+        sizes = [h * w for h, w in vit_grid]
+        merged = [
+            self._merge(image, h, w)
+            for image, (h, w) in zip(x.split(sizes), vit_grid, strict=True)
+        ]
+        # Changing the first projection's row count changes its BF16 rounding.
+        hidden = torch.cat([self.w1(image)[0] for image in merged])
+        out, _ = self.w2(F.gelu(hidden))
+        return out.split([image.shape[0] for image in merged])
 
 
 def run_dp_sharded_vision_tower(
