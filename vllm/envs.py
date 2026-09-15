@@ -12,6 +12,9 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_IMAGES: int = 8
+    VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_TOKENS: int = 32768
+    VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_ATTN_WORK: int = 268435456
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -608,6 +611,16 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Bounds for packed DeepSeek-V4.1 vision inference. One image disables it.
+    "VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_IMAGES": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_IMAGES", "8")
+    ),
+    "VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_TOKENS": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_TOKENS", "32768")
+    ),
+    "VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_ATTN_WORK": lambda: int(
+        os.getenv("VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_ATTN_WORK", "268435456")
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

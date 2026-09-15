@@ -22,6 +22,7 @@ from typing import Annotated
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -42,6 +43,7 @@ from vllm.models.deepseek_v4.common.vision import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.v1.utils import record_function_or_nullcontext
 
 from ..common.mm_preprocess import (
     IMAGE,
@@ -140,6 +142,13 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         model_config = vllm_config.model_config
         config = model_config.hf_config
         self.config = config
+        self._vit_batch_limits = (
+            envs.VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_IMAGES,
+            envs.VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_TOKENS,
+            envs.VLLM_DEEPSEEK_V41_VIT_MAX_BATCH_ATTN_WORK,
+        )
+        if min(self._vit_batch_limits) <= 0:
+            raise ValueError("DeepSeek vision batch limits must be positive")
         self.multimodal_config = model_config.multimodal_config
         assert self.multimodal_config is not None
 
@@ -219,6 +228,41 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         span[types == IMAGE] = image_embeds
         return span
 
+    def _encode_image_batches(
+        self, patches: torch.Tensor, vit_grid: list[list[int]]
+    ) -> list[torch.Tensor]:
+        max_images, max_tokens, max_work = self._vit_batch_limits
+        image_embeds: list[torch.Tensor] = []
+        offset = 0
+        start = 0
+        while start < len(vit_grid):
+            end, tokens, work = start, 0, 0
+            while end < len(vit_grid):
+                h, w = vit_grid[end]
+                size = h * w
+                if end > start and (
+                    end - start >= max_images
+                    or tokens + size > max_tokens
+                    or work + size * size > max_work
+                ):
+                    break
+                tokens += size
+                work += size * size
+                end += 1
+            batch = patches[offset : offset + tokens]
+            grid = vit_grid[start:end]
+            with record_function_or_nullcontext(
+                f"vit.batch images={len(grid)} patches={tokens}"
+            ):
+                # Oversized singletons retain the established execution path.
+                if len(grid) == 1:
+                    image_embeds.append(self._encode_image(batch, *grid[0]))
+                else:
+                    x = self.vision.forward_packed(batch, grid)
+                    image_embeds.extend(self.aligner.forward_packed(x, grid))
+            start, offset = end, offset + tokens
+        return image_embeds
+
     def _process_image_input(
         self,
         image_input: DeepseekV4VLImagePixelInputs,
@@ -233,6 +277,14 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
             image_embeds_list = run_dp_sharded_vision_tower(
                 self.vision, self.aligner, patches, vit_grid
             )
+        elif (
+            get_tensor_model_parallel_world_size() == 1
+            and self._vit_batch_limits[0] > 1
+            and patches.is_cuda
+            and not torch.is_grad_enabled()
+            and self.vision.supports_packed_attention
+        ):
+            image_embeds_list = self._encode_image_batches(patches, vit_grid)
         else:
             image_embeds_list = []
             vit_offset = 0
