@@ -31,6 +31,7 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    StageMissingLayer,
     WeightsMapper,
     maybe_prefix,
 )
@@ -328,14 +329,33 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
+        mapped = self.hf_to_vllm_mapper.apply(weights)
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
+        # The child finalizes fused experts at the end of load_weights.
+        # Call it once without retaining the entire language checkpoint;
+        # only the small vision tower needs buffering for prefix grouping.
+        language_prefix = "language_model."
+        vl_weights: list[tuple[str, torch.Tensor]] = []
+
+        def language_weights() -> Iterable[tuple[str, torch.Tensor]]:
+            for name, weight in mapped:
+                if name.startswith(language_prefix):
+                    yield name[len(language_prefix) :], weight
+                else:
+                    vl_weights.append((name, weight))
+
+        if isinstance(self.language_model, StageMissingLayer):
+            for _ in language_weights():
+                pass
+            loaded_params = set()
+        else:
+            language_params = self.language_model.load_weights(language_weights())
+            loaded_params = {
+                maybe_prefix("language_model", name) for name in language_params
+            }
+        loaded_params.update(
+            loader.load_weights(sorted(vl_weights, key=lambda item: item[0]))
+        )
         # The child's load_weights already ran its post-load finalization.
         self._weights_finalized = True
         return loaded_params
