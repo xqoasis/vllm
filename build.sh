@@ -23,6 +23,17 @@ retry() {
   done
 }
 
+# TOS endpoints must bypass the build environment's HTTP proxies.
+export no_proxy="${no_proxy:-${NO_PROXY:-}}"
+export NO_PROXY="${NO_PROXY:-${no_proxy}}"
+for proxy_var in no_proxy NO_PROXY; do
+  proxy_bypass="${!proxy_var}"
+  case ",${proxy_bypass}," in
+    *,.volces.com,*) ;;
+    *) printf -v "${proxy_var}" '%s' "${proxy_bypass:+${proxy_bypass},}.volces.com" ;;
+  esac
+done
+
 ls -l
 
 # =====================
@@ -198,6 +209,11 @@ retry apt-get install -y \
   python3-dev \
   python3-pip
 
+# Select and validate the image's existing GCC toolchain.
+# shellcheck source=tools/setup_build_gcc.sh
+source "$(dirname "${BASH_SOURCE[0]}")/tools/setup_build_gcc.sh"
+setup_build_gcc
+
 # =====================
 # install cuda toolkit by runfile if missing
 # =====================
@@ -294,6 +310,17 @@ if [ "${nvcc_version}" != "${CUDA_VERSION}" ]; then
   echo "Set CUSTOM_CUDA_HOME to the CUDA ${CUDA_VERSION} toolkit prefix."
   exit 1
 fi
+
+# Verify nvcc accepts the selected GCC before starting the wheel build.
+cuda_probe_dir="$(mktemp -d)"
+printf '#include <cuda_runtime.h>\nint main() { return 0; }\n' > "${cuda_probe_dir}/host.cu"
+if ! "${CUDA_HOME}/bin/nvcc" -ccbin "${CUDAHOSTCXX}" -std=c++20 \
+    -c "${cuda_probe_dir}/host.cu" -o "${cuda_probe_dir}/host.o"; then
+  rm -rf "${cuda_probe_dir}"
+  echo "CUDA ${CUDA_VERSION} cannot compile with ${CUDAHOSTCXX}; select compatible installed compilers via CC/CXX or use a matching build image."
+  exit 1
+fi
+rm -rf "${cuda_probe_dir}"
 
 # =====================
 # python deps
