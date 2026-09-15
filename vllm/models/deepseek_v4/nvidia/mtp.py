@@ -59,7 +59,9 @@ from vllm.sequence import IntermediateTensors
 
 from .model import (
     DeepseekV4DecoderLayer,
+    DeepseekV4MixtureOfExperts,
     DeepseekV4Model,
+    DeepseekV4MoE,
     _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
 )
@@ -279,7 +281,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         return logits
 
 
-class DeepSeekV4MTP(nn.Module):
+class DeepSeekV4MTP(nn.Module, DeepseekV4MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -290,6 +292,24 @@ class DeepSeekV4MTP(nn.Module):
         self.model = DeepSeekV4MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+
+        self.set_moe_parameters()
+
+    def set_moe_parameters(self) -> None:
+        self.num_expert_groups = getattr(self.config, "n_group", 1)
+        self.moe_layers: list[nn.Module] = []
+        self.moe_mlp_layers: list[DeepseekV4MoE] = []
+        example_moe: DeepseekV4MoE | None = None
+        for layer in self.model.layers.values():
+            if not isinstance(layer.mtp_block, DeepseekV4DecoderLayer):
+                continue
+            if isinstance(layer.mtp_block.ffn, DeepseekV4MoE):
+                example_moe = layer.mtp_block.ffn
+                self.moe_mlp_layers.append(layer.mtp_block.ffn)
+                self.moe_layers.append(layer.mtp_block.ffn.experts)
+
+        self.num_moe_layers = len(self.moe_layers)
+        self.extract_moe_parameters(example_moe)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

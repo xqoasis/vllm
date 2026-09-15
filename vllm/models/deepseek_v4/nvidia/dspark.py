@@ -51,7 +51,9 @@ from vllm.models.common.ops.sequence_parallel import (
 
 from .model import (
     DeepseekV4DecoderLayer,
+    DeepseekV4MixtureOfExperts,
     DeepseekV4Model,
+    DeepseekV4MoE,
     _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
 )
@@ -299,7 +301,7 @@ def _insert_context_kv(
         )
 
 
-class DSparkDeepseekV4ForCausalLM(nn.Module):
+class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's.
     has_own_embed_tokens = False
@@ -326,6 +328,24 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+
+        self.set_moe_parameters()
+
+    def set_moe_parameters(self) -> None:
+        self.num_expert_groups = getattr(self.config, "n_group", 1)
+        self.moe_layers: list[nn.Module] = []
+        self.moe_mlp_layers: list[DeepseekV4MoE] = []
+        example_moe: DeepseekV4MoE | None = None
+        for layer in self.model.layers:
+            if not isinstance(layer, DeepseekV4DecoderLayer):
+                continue
+            if isinstance(layer.ffn, DeepseekV4MoE):
+                example_moe = layer.ffn
+                self.moe_mlp_layers.append(layer.ffn)
+                self.moe_layers.append(layer.ffn.experts)
+
+        self.num_moe_layers = len(self.moe_layers)
+        self.extract_moe_parameters(example_moe)
 
     # --- Hooks used by the speculator -------------------------------------
 
