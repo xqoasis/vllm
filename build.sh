@@ -1,4 +1,6 @@
 #!/bin/bash
+# SCM may invoke this script with bash -x; never trace upload credentials.
+set +x
 set -euo pipefail
 
 retry() {
@@ -123,6 +125,7 @@ esac
 # =====================
 CUDA_INSTALL_METHOD="runfile"
 CUDA_RUNFILE_URL=""
+CUDA_RUNFILE_MD5=""
 
 case "${CUSTOM_CUDA_TAG}" in
   cu129)
@@ -154,9 +157,11 @@ case "${CUSTOM_CUDA_TAG}" in
     case "${RUNFILE_ARCH}" in
       x86_64)
         CUDA_RUNFILE_URL="${CUSTOM_CUDA_130_X86_64_RUNFILE_URL}"
+        CUDA_RUNFILE_MD5="${CUSTOM_CUDA_RUNFILE_MD5:-3f092554675f004250d4dfc1d6c3acc9}"
         ;;
       sbsa)
         CUDA_RUNFILE_URL="${CUSTOM_CUDA_130_SBSA_RUNFILE_URL}"
+        CUDA_RUNFILE_MD5="${CUSTOM_CUDA_RUNFILE_MD5:-89911a0ae0b2ba797025fbe1b641c4b5}"
         ;;
       *)
         echo "Unsupported RUNFILE_ARCH=${RUNFILE_ARCH}"
@@ -209,7 +214,10 @@ retry apt-get install -y \
   python3-dev \
   python3-pip
 
-# Select and validate the image's existing GCC toolchain.
+# The Python 3.11 SCM image has GCC 12; cu130 needs a matching GCC 13 toolchain.
+if [ "${CUSTOM_CUDA_TAG}" = "cu130" ]; then
+  export CUSTOM_GCC_BOOTSTRAP="${CUSTOM_GCC_BOOTSTRAP:-1}"
+fi
 # shellcheck source=tools/setup_build_gcc.sh
 source "$(dirname "${BASH_SOURCE[0]}")/tools/setup_build_gcc.sh"
 setup_build_gcc
@@ -231,13 +239,22 @@ if [ ! -x "${CUSTOM_CUDA_HOME}/bin/nvcc" ]; then
 
   rm -f cuda-runfile.run
 
-  retry wget \
-    --tries="${CUSTOM_WGET_TRIES}" \
-    --timeout="${CUSTOM_WGET_TIMEOUT}" \
-    --read-timeout="${CUSTOM_WGET_TIMEOUT}" \
-    --continue \
-    -O cuda-runfile.run \
-    "${CUDA_RUNFILE_URL}"
+  if [ "${CUSTOM_CUDA_TAG}" = "cu130" ]; then
+    # A single proxy connection can spend the entire SCM timeout downloading
+    # the 4 GB runfile. Split the transfer, then check NVIDIA's published digest.
+    # https://developer.download.nvidia.com/compute/cuda/13.0.2/docs/sidebar/md5sum.txt
+    retry apt-get install -y --no-install-recommends aria2
+    retry bash "$(dirname "${BASH_SOURCE[0]}")/tools/download_cuda_runfile.sh" \
+      "${CUDA_RUNFILE_URL}" cuda-runfile.run "${CUDA_RUNFILE_MD5}"
+  else
+    retry wget \
+      --tries="${CUSTOM_WGET_TRIES}" \
+      --timeout="${CUSTOM_WGET_TIMEOUT}" \
+      --read-timeout="${CUSTOM_WGET_TIMEOUT}" \
+      --continue \
+      -O cuda-runfile.run \
+      "${CUDA_RUNFILE_URL}"
+  fi
 
   chmod +x cuda-runfile.run
 
